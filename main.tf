@@ -1,20 +1,27 @@
 data "aws_partition" "current" {}
+data "aws_caller_identity" "current" {}
+
+locals {
+  create = var.create
+
+  cluster_role = try(aws_iam_role.this[0].arn, var.iam_role_arn)
+}
 
 ################################################################################
 # Cluster
 ################################################################################
 
 resource "aws_eks_cluster" "this" {
-  count = var.create ? 1 : 0
+  count = local.create ? 1 : 0
 
   name                      = var.cluster_name
-  role_arn                  = try(aws_iam_role.this[0].arn, var.iam_role_arn)
+  role_arn                  = local.cluster_role
   version                   = var.cluster_version
   enabled_cluster_log_types = var.cluster_enabled_log_types
 
   vpc_config {
     security_group_ids      = compact(distinct(concat(var.cluster_additional_security_group_ids, [local.cluster_security_group_id])))
-    subnet_ids              = var.subnet_ids
+    subnet_ids              = coalescelist(var.control_plane_subnet_ids, var.subnet_ids)
     endpoint_private_access = var.cluster_endpoint_private_access
     endpoint_public_access  = var.cluster_endpoint_public_access
     public_access_cidrs     = var.cluster_endpoint_public_access_cidrs
@@ -30,7 +37,7 @@ resource "aws_eks_cluster" "this" {
 
     content {
       provider {
-        key_arn = encryption_config.value.provider_key_arn
+        key_arn = var.create_kms_key ? module.kms.key_arn : encryption_config.value.provider_key_arn
       }
       resources = encryption_config.value.resources
     }
@@ -67,11 +74,41 @@ resource "aws_ec2_tag" "cluster_primary_security_group" {
 }
 
 resource "aws_cloudwatch_log_group" "this" {
-  count = var.create && var.create_cloudwatch_log_group ? 1 : 0
+  count = local.create && var.create_cloudwatch_log_group ? 1 : 0
 
   name              = "/aws/eks/${var.cluster_name}/cluster"
   retention_in_days = var.cloudwatch_log_group_retention_in_days
   kms_key_id        = var.cloudwatch_log_group_kms_key_id
+
+  tags = var.tags
+}
+
+################################################################################
+# KMS Key
+################################################################################
+
+module "kms" {
+  source  = "terraform-aws-modules/kms/aws"
+  version = "1.0.1" # Note - be mindful of Terraform/provider version compatibility between modules
+
+  create = var.create_kms_key
+
+  description             = coalesce(var.kms_key_description, "${var.cluster_name} cluster encryption key")
+  key_usage               = "ENCRYPT_DECRYPT"
+  deletion_window_in_days = var.kms_key_deletion_window_in_days
+  enable_key_rotation     = var.enable_kms_key_rotation
+
+  # Policy
+  enable_default_policy     = var.kms_key_enable_default_policy
+  key_owners                = var.kms_key_owners
+  key_administrators        = coalescelist(var.kms_key_administrators, [data.aws_caller_identity.current.arn])
+  key_users                 = concat([local.cluster_role], var.kms_key_users)
+  key_service_users         = var.kms_key_service_users
+  source_policy_documents   = var.kms_key_source_policy_documents
+  override_policy_documents = var.kms_key_override_policy_documents
+
+  # Aliases
+  aliases = concat(["eks/${var.cluster_name}"], var.kms_key_aliases)
 
   tags = var.tags
 }
@@ -83,7 +120,7 @@ resource "aws_cloudwatch_log_group" "this" {
 
 locals {
   cluster_sg_name   = coalesce(var.cluster_security_group_name, "${var.cluster_name}-cluster")
-  create_cluster_sg = var.create && var.create_cluster_security_group
+  create_cluster_sg = local.create && var.create_cluster_security_group
 
   cluster_security_group_id = local.create_cluster_sg ? aws_security_group.cluster[0].id : var.cluster_security_group_id
 
@@ -162,13 +199,13 @@ resource "aws_security_group_rule" "cluster" {
 ################################################################################
 
 data "tls_certificate" "this" {
-  count = var.create && var.enable_irsa ? 1 : 0
+  count = local.create && var.enable_irsa ? 1 : 0
 
   url = aws_eks_cluster.this[0].identity[0].oidc[0].issuer
 }
 
 resource "aws_iam_openid_connect_provider" "oidc_provider" {
-  count = var.create && var.enable_irsa ? 1 : 0
+  count = local.create && var.enable_irsa ? 1 : 0
 
   client_id_list  = distinct(compact(concat(["sts.${local.dns_suffix}"], var.openid_connect_audiences)))
   thumbprint_list = concat([data.tls_certificate.this[0].certificates[0].sha1_fingerprint], var.custom_oidc_thumbprints)
@@ -185,7 +222,7 @@ resource "aws_iam_openid_connect_provider" "oidc_provider" {
 ################################################################################
 
 locals {
-  create_iam_role   = var.create && var.create_iam_role
+  create_iam_role   = local.create && var.create_iam_role
   iam_role_name     = coalesce(var.iam_role_name, "${var.cluster_name}-cluster")
   policy_arn_prefix = "arn:${data.aws_partition.current.partition}:iam::aws:policy"
 
@@ -197,7 +234,7 @@ locals {
 }
 
 data "aws_iam_policy_document" "assume_role_policy" {
-  count = var.create && var.create_iam_role ? 1 : 0
+  count = local.create && var.create_iam_role ? 1 : 0
 
   statement {
     sid     = "EKSClusterAssumeRole"
@@ -248,7 +285,7 @@ resource "aws_iam_role" "this" {
   tags = merge(var.tags, var.iam_role_tags)
 }
 
-# Policies attached ref https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/eks_node_group
+# Policies attached ref https://docs.aws.amazon.com/eks/latest/userguide/service_IAM_role.html
 resource "aws_iam_role_policy_attachment" "this" {
   for_each = local.create_iam_role ? toset(compact(distinct(concat([
     "${local.policy_arn_prefix}/AmazonEKSClusterPolicy",
@@ -286,7 +323,7 @@ resource "aws_iam_policy" "cluster_encryption" {
           "kms:DescribeKey",
         ]
         Effect   = "Allow"
-        Resource = [for config in var.cluster_encryption_config : config.provider_key_arn]
+        Resource = var.create_kms_key ? [module.kms.key_arn] : [for config in var.cluster_encryption_config : config.provider_key_arn]
       },
     ]
   })
@@ -299,7 +336,7 @@ resource "aws_iam_policy" "cluster_encryption" {
 ################################################################################
 
 resource "aws_eks_addon" "this" {
-  for_each = { for k, v in var.cluster_addons : k => v if var.create }
+  for_each = { for k, v in var.cluster_addons : k => v if local.create }
 
   cluster_name = aws_eks_cluster.this[0].name
   addon_name   = try(each.value.name, each.key)
@@ -307,12 +344,6 @@ resource "aws_eks_addon" "this" {
   addon_version            = lookup(each.value, "addon_version", null)
   resolve_conflicts        = lookup(each.value, "resolve_conflicts", null)
   service_account_role_arn = lookup(each.value, "service_account_role_arn", null)
-
-  lifecycle {
-    ignore_changes = [
-      modified_at
-    ]
-  }
 
   depends_on = [
     module.fargate_profile,
@@ -329,7 +360,7 @@ resource "aws_eks_addon" "this" {
 ################################################################################
 
 resource "aws_eks_identity_provider_config" "this" {
-  for_each = { for k, v in var.cluster_identity_providers : k => v if var.create }
+  for_each = { for k, v in var.cluster_identity_providers : k => v if local.create }
 
   cluster_name = aws_eks_cluster.this[0].name
 
@@ -352,21 +383,33 @@ resource "aws_eks_identity_provider_config" "this" {
 ################################################################################
 
 locals {
-  node_iam_role_arns_non_windows = compact(concat(
-    [for group in module.eks_managed_node_group : group.iam_role_arn],
-    [for group in module.self_managed_node_group : group.iam_role_arn if group.platform != "windows"],
-    var.aws_auth_node_iam_role_arns_non_windows,
-  ))
+  node_iam_role_arns_non_windows = distinct(
+    compact(
+      concat(
+        [for group in module.eks_managed_node_group : group.iam_role_arn],
+        [for group in module.self_managed_node_group : group.iam_role_arn if group.platform != "windows"],
+        var.aws_auth_node_iam_role_arns_non_windows,
+      )
+    )
+  )
 
-  node_iam_role_arns_windows = compact(concat(
-    [for group in module.self_managed_node_group : group.iam_role_arn if group.platform == "windows"],
-    var.aws_auth_node_iam_role_arns_windows,
-  ))
+  node_iam_role_arns_windows = distinct(
+    compact(
+      concat(
+        [for group in module.self_managed_node_group : group.iam_role_arn if group.platform == "windows"],
+        var.aws_auth_node_iam_role_arns_windows,
+      )
+    )
+  )
 
-  fargate_profile_pod_execution_role_arns = compact(concat(
-    [for group in module.fargate_profile : group.fargate_profile_pod_execution_role_arn],
-    var.aws_auth_fargate_profile_pod_execution_role_arns,
-  ))
+  fargate_profile_pod_execution_role_arns = distinct(
+    compact(
+      concat(
+        [for group in module.fargate_profile : group.fargate_profile_pod_execution_role_arn],
+        var.aws_auth_fargate_profile_pod_execution_role_arns,
+      )
+    )
+  )
 
   aws_auth_configmap_data = {
     mapRoles = yamlencode(concat(

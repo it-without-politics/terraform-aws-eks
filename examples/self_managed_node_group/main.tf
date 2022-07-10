@@ -7,7 +7,7 @@ provider "kubernetes" {
   cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
 
   exec {
-    api_version = "client.authentication.k8s.io/v1alpha1"
+    api_version = "client.authentication.k8s.io/v1beta1"
     command     = "aws"
     # This requires the awscli to be installed locally where Terraform is executed
     args = ["eks", "get-token", "--cluster-name", module.eks.cluster_id]
@@ -97,6 +97,12 @@ module "eks" {
 
   self_managed_node_group_defaults = {
     create_security_group = false
+
+    # enable discovery of autoscaling groups by cluster-autoscaler
+    autoscaling_group_tags = {
+      "k8s.io/cluster-autoscaler/enabled" : true,
+      "k8s.io/cluster-autoscaler/${local.name}" : "owned",
+    }
   }
 
   self_managed_node_groups = {
